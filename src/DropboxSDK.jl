@@ -50,7 +50,7 @@ function start_task(fun::Function, info=nothing)::Task
                 println("Context: ", string(info))
             end
             println("Exception: ", string(ex)[1:min(10000, end)])
-            println("Backtrace: ", catch_backtrace())
+            println("Backtrace: ", stacktrace(catch_backtrace()))
             rethrow()
         end
     end
@@ -183,21 +183,11 @@ function post_http(auth::Authorization,
         body = content
     end
 
-    retry_count = 0
     result = nothing
     result_content = HTTP.nobody
 
-    @label retry_after_error
-    if retry_count >= 3
-        println("Info: Giving up after attempt #$retry_count.")
-        throw(DropboxError(result))
-    end
-    retry_count += 1
-    if retry_count > 1
-        println("Info: Retrying, attempt #$retry_count...")
-    end
-
-    @label retry_after_wait
+    retry_count = 1
+    @label retry
 
     wait_as_requested()
 
@@ -225,45 +215,80 @@ function post_http(auth::Authorization,
     catch exception
         if exception isa HTTP.StatusError
             response = exception.response
-            result = JSON.parse(String(response.body);
-                                dicttype=Dict, inttype=Int64)
+            result = try
+                JSON.parse(String(response.body); dicttype=Dict, inttype=Int64)
+            catch
+                Dict("error_summary" =>
+                     "No JSON result in HTTP error: $response")
+            end
+            result["http_status"] = exception.status
+            error_summary = get(result, "error_summary",
+                                "(no error summary in HTTP error): $response")
 
             # Should we retry?
             retry_after = mapget(s->parse(Float64, s),
                                  Dict(response.headers), "Retry-After")
             if retry_after !== nothing
-                println("Info: Warning $(exception.status):",
-                        " $(result["error_summary"])")
+                println("Info: Warning $(exception.status): $error_summary")
                 set_retry_delay(retry_after)
-                @goto retry_after_wait
+                @goto retry
             end
-            # Status error without retry header -- give up
-            throw(DropboxError(result))
 
-        elseif (exception isa ArgumentError &&
-                (exception.msg ==
-                 "`unsafe_write` requires `iswritable(::SSLContext)`"))
-            # I don't understand this error; maybe it is ephemeral? We
-            # will retry.
+            # If this is a real error (e.g. a file does not exist),
+            # report in right away without retrying
+            if (exception.status in (400, 401, 403, 409) &&
+                get(result, ".tag", nothing) != "internal_error")
+
+                throw(DropboxError(result))
+            end
+
+            # Too many weird things can go wrong. We will thus retry
+            # for any error. If the error goes away, we don't really
+            # care. If it persists, we'll give up after several
+            # retries.
             println("Info: Error $exception")
-            @goto retry_after_error
-
-        elseif (exception isa ErrorException &&
-                startswith(exception.msg, "Unexpected end of input\nLine: 0\n"))
-            # I don't understand this error; maybe it is ephemeral? We
-            # will retry.
-            println("Info: Error $exception")
-            @goto retry_after_error
-
-        elseif exception isa Base.IOError
-            # I don't understand this error; maybe it is ephemeral? We
-            # will retry.
-            println("Info: Error $exception")
-            @goto retry_after_error
-
+            if retry_count >= 3
+                println("Info: Giving up after attempt #$retry_count.")
+                # The error was properly diagnosed and reported by
+                # Dropbox
+                throw(DropboxError(result))
+            end
+            retry_count += 1
+            println("Info: Retrying, attempt #$retry_count...")
+            sleep(1)
+            @goto retry
         end
-        # Some other error -- give up
-        rethrow(exception)
+
+        # Too many weird things can go wrong. We will thus retry for
+        # any error. If the error goes away, we don't really care. If
+        # it persists, we'll give up after several retries.
+        println("Info: Error $exception")
+        if retry_count >= 3
+            println("Info: Giving up after attempt #$retry_count.")
+            # This is probably not an error in Dropbox
+            rethrow()
+        end
+        retry_count += 1
+        println("Info: Retrying, attempt #$retry_count...")
+        sleep(1)
+        @goto retry
+
+        # elseif (exception isa ArgumentError &&
+        #         (exception.msg ==
+        #          "`unsafe_write` requires `iswritable(::SSLContext)`"))
+        #     # I don't understand this error; maybe it is ephemeral? We
+        #     # will retry.
+        # elseif (exception isa ErrorException &&
+        #         startswith(exception.msg,
+        #                    "Unexpected end of input\nLine: 0\n"))
+        #     # This is a JSON parsing error. Something went wrong with
+        #     # Dropbox's response. We will retry.
+        # elseif exception isa Base.IOError
+        #     # I don't understand this error; maybe it is ephemeral? We
+        #     # will retry.
+        # elseif exception isa HTTP.IOExtras.IOError
+        #     # I don't understand this error; maybe it is ephemeral? We
+        #     # will retry.
     end
 
     # The request worked -- return

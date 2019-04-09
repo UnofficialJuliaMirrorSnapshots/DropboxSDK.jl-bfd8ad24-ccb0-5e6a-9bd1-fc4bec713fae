@@ -8,7 +8,8 @@ function runcmd(args::Cmd; wrap=identity)::Vector{String}
     julia = Base.julia_cmd()
     dbftp = joinpath("..", "bin", "dbftp.jl")
     lines = String[]
-    open(wrap(`$julia $dbftp $args`)) do io
+    cmd = `$julia $dbftp $args`
+    open(wrap(cmd)) do io
         skipcount = 0
         for line in eachline(io)
             if skipcount > 0
@@ -31,6 +32,26 @@ end
 
 @testset "Command version" begin
     lines = runcmd(`version`)
+    @test length(lines) == 1
+    m = match(r"^Version\s+(.*)", lines[1])
+    @test m !== nothing
+    version = VersionNumber(m.captures[1])
+end
+
+
+
+@testset "Option --verbose" begin
+    lines = runcmd(`--verbose version`)
+    @test length(lines) == 1
+    m = match(r"^Version\s+(.*)", lines[1])
+    @test m !== nothing
+    version = VersionNumber(m.captures[1])
+end
+
+
+
+@testset "Option --debug" begin
+    lines = runcmd(`--debug version`)
     @test length(lines) == 1
     m = match(r"^Version\s+(.*)", lines[1])
     @test m !== nothing
@@ -147,6 +168,15 @@ end
 @testset "Command ls" begin
     lines = runcmd(`ls $folder`)
     @test lines == ["dir",
+                    "hello",
+                    "hello1",
+                    "hello2",
+                    ]
+
+    lines = runcmd(`ls -R $folder`)
+    @test lines == [".",
+                    "dir",
+                    "dir/hello3",
                     "hello",
                     "hello1",
                     "hello2",
